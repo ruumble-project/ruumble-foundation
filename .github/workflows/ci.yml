@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go (format, vet, tests, generated code)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+      - name: Generated code matches proto/
+        run: buf generate && git diff --exit-code -- gen
+      - run: docker build -t ruumble-foundation .

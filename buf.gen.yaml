@@ -1,0 +1,17 @@
+# Generates gen/ from proto/: buf generate. The generated code is committed, so building needs no tools.
+version: v2
+inputs:
+  - directory: proto
+managed:
+  enabled: true
+  override:
+    - file_option: go_package
+      path: mumble/Mumble.proto
+      value: github.com/ruumble-project/ruumble-foundation/gen/mumble/mumbleproto
+    - file_option: go_package
+      path: mumble/MumbleUDP.proto
+      value: github.com/ruumble-project/ruumble-foundation/gen/mumble/mumbleudp
+plugins:
+  - local: ["go", "tool", "protoc-gen-go"]
+    out: .
+    opt: module=github.com/ruumble-project/ruumble-foundation
