@@ -1,0 +1,4 @@
+/foundation
+/dist/
+*.test
+*.out
