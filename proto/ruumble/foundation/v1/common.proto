@@ -1,0 +1,22 @@
+// Types shared by every foundation service (ADR-0031). Draft: fields may change until the first release.
+syntax = "proto3";
+
+package ruumble.foundation.v1;
+
+// The person on whose behalf a request is made. The foundation decides whether they may do it.
+message Actor {
+  // SHA-1 hash of the person's client certificate, hex encoded, as Mumble reports it.
+  string cert_hash = 1;
+  // Mumble session while the person is connected; 0 when not connected.
+  uint32 session = 2;
+}
+
+// Where in the replicated log an answer was taken from.
+message Position {
+  // Raft term of the leader the node follows; a client that hears two nodes follows the higher term (ADR-0029).
+  uint64 term = 1;
+  // Index of the last log entry applied on the answering node.
+  uint64 applied_index = 2;
+  // True when the answering node is outside the majority: reads may be stale and commands are rejected.
+  bool minority = 3;
+}

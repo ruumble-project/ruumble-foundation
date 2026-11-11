@@ -1,0 +1,111 @@
+// Live state between nodes (ADR-0029, ADR-0032): each node announces the sessions homed on it. Nothing here goes
+// through Raft. Draft: fields may change until the foundation's first release.
+syntax = "proto3";
+
+package ruumble.node.v1;
+
+import "ruumble/foundation/v1/live.proto";
+import "ruumble/node/v1/voice.proto";
+
+// A session homed on the sending node: its voice goes in and out there. Always sent whole; it replaces what the
+// receiver held for this session id.
+message Session {
+  // Unique in the cluster: node number in the top 8 bits. Kept when a Ruumble Client moves.
+  uint32 session = 1;
+  // Grows with every move. If two nodes announce the same session, the higher claim wins, with equal claims the
+  // lower node number; the loser stops serving it.
+  uint64 claim = 2;
+  // SHA-1 hash of the client certificate, hex encoded, as Mumble reports it.
+  string cert_hash = 3;
+  // Registered user id; unset for unregistered users.
+  optional uint32 user_id = 4;
+  string name = 5;
+  uint32 channel_id = 6;
+  // Channels the user listens to (ADR-0027).
+  repeated uint32 listening_channel_ids = 7;
+  bool mute = 8;
+  bool deaf = 9;
+  bool suppress = 10;
+  bool self_mute = 11;
+  bool self_deaf = 12;
+  bool priority_speaker = 13;
+  bool recording = 14;
+  // Mumble version of the client, as in Mumble's Version.version_v2.
+  uint64 client_version = 15;
+  // True for Ruumble Client, which can move between nodes without a reconnect.
+  bool ruumble_client = 16;
+}
+
+// All sessions homed on the sending node, and its status. Sent once on every new connection, after Hello.
+message Sync {
+  repeated Session sessions = 1;
+  NodeStatus node_status = 2;
+}
+
+// A session homed on the sending node is gone from it.
+message SessionGone {
+  uint32 session = 1;
+  // The claim the session had here; a receiver holding a higher claim from another node ignores this.
+  uint64 claim = 2;
+  Reason reason = 3;
+
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    // The client disconnected or was kicked: gone from the cluster.
+    REASON_LEFT = 1;
+    // A Ruumble Client moved to another node, which announces it with a higher claim.
+    REASON_MOVED = 2;
+  }
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_SERVING = 1;
+  // Takes no new clients and moves its clients away (ADR-0029, planned switch).
+  NODE_STATE_DRAINING = 2;
+}
+
+message NodeStatus {
+  NodeState state = 1;
+}
+
+// A change to a session homed on the receiving node, made by someone elsewhere. The sending node has checked the
+// actor's permissions; the home node applies the change and announces the new Session.
+message UserCommand {
+  // The session acting.
+  uint32 actor_session = 1;
+  // The session changed; homed on the receiving node.
+  uint32 session = 2;
+  oneof command {
+    Change change = 3;
+    Kick kick = 4;
+  }
+
+  // Unset fields stay as they are.
+  message Change {
+    optional uint32 channel_id = 1;
+    optional bool mute = 2;
+    optional bool deaf = 3;
+    optional bool suppress = 4;
+    optional bool priority_speaker = 5;
+  }
+
+  message Kick {
+    string reason = 1;
+  }
+}
+
+// Something passed on and never stored: a Mumble text message or a foundation relay (ADR-0031). Sent to every
+// peer; each delivers to its own clients among the recipients.
+message Deliver {
+  // Session of the sender; 0 for a relay from someone not connected.
+  uint32 from_session = 1;
+  // Certificate hash of the sender.
+  string from_cert_hash = 2;
+  Recipients to = 3;
+  oneof body {
+    // Mumble TextMessage.message (HTML as Mumble sends it).
+    string text = 4;
+    ruumble.foundation.v1.Delivery relay = 5;
+  }
+}

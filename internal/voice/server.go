@@ -2,13 +2,16 @@
 // handshake, keeps the list of users in step and forwards voice between them.
 //
 // This first cut has one channel (the root), no stored state, and voice tunnelled over TCP only; UDP with OCB2
-// follows. Clients older than Mumble 1.5 are turned away (ADR-0030), so voice is always in the Protobuf format of
+// follows. With an interconnect (Config.Mesh) the node shows the users of the other nodes and exchanges voice with
+// them (ADR-0032). Clients older than Mumble 1.5 are turned away (ADR-0030), so voice is always in the Protobuf format of
 // MumbleUDP.proto.
 package voice
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +23,7 @@ import (
 
 	"github.com/ruumble-project/ruumble-foundation/gen/mumble/mumbleproto"
 	"github.com/ruumble-project/ruumble-foundation/gen/mumble/mumbleudp"
+	nodev1 "github.com/ruumble-project/ruumble-foundation/gen/ruumble/node/v1"
 	"github.com/ruumble-project/ruumble-foundation/internal/wire"
 )
 
@@ -58,6 +62,12 @@ type Config struct {
 	// MaxBandwidth announced to clients, in bits per second.
 	MaxBandwidth uint32
 	Log          *slog.Logger
+	// Node is this node's number, 1 to 255, the top 8 bits of every session id it hands out. Defaults to 1.
+	Node uint32
+	// Mesh connects the node to the others; nil for a node on its own.
+	Mesh Interconnect
+	// Grace is how long the sessions of a lost peer stay visible (ADR-0032). Defaults to 10 s.
+	Grace time.Duration
 }
 
 // Server holds the users connected to this node.
@@ -65,9 +75,12 @@ type Server struct {
 	cfg Config
 	log *slog.Logger
 
-	mu    sync.Mutex
-	next  uint32
-	users map[uint32]*user
+	mu      sync.Mutex
+	counter uint32
+	users   map[uint32]*user
+	remote  map[uint32]*remote
+	grace   map[uint32]*time.Timer
+	seen    seen
 }
 
 // New makes a server; Serve starts it.
@@ -79,7 +92,20 @@ func New(cfg Config) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{cfg: cfg, log: log, users: map[uint32]*user{}}
+	if cfg.Node == 0 {
+		cfg.Node = 1
+	}
+	if cfg.Grace == 0 {
+		cfg.Grace = 10 * time.Second
+	}
+	return &Server{
+		cfg:     cfg,
+		log:     log,
+		counter: randomCounter(),
+		users:   map[uint32]*user{},
+		remote:  map[uint32]*remote{},
+		grace:   map[uint32]*time.Timer{},
+	}
 }
 
 // Serve accepts clients on ln until ctx ends.
@@ -100,19 +126,31 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-// Users is the number of connected users.
+// Users is the number of users connected to this node.
 func (s *Server) Users() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.users)
 }
 
+// Remote is the number of users known on other nodes.
+func (s *Server) Remote() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.remote)
+}
+
 type user struct {
-	session uint32
-	name    string
-	channel uint32
-	mute    bool
-	deaf    bool
+	session  uint32
+	claim    uint64
+	certHash string
+	version  uint64
+	name     string
+	channel  uint32
+	mute     bool
+	deaf     bool
+	// replaced is set when another node took the session over; leaving then announces nothing.
+	replaced bool
 
 	out  chan []byte
 	done chan struct{}
@@ -189,6 +227,10 @@ func (s *Server) handle(ctx context.Context, conn *tls.Conn) {
 		VersionV2: proto.Uint64(announced),
 		Release:   proto.String("Ruumble Foundation"),
 	})
+	if certs := conn.ConnectionState().PeerCertificates; len(certs) > 0 {
+		sum := sha1.Sum(certs[0].Raw)
+		u.certHash = hex.EncodeToString(sum[:])
+	}
 	name, err := s.handshake(conn, u)
 	if err != nil {
 		if !errors.Is(err, errRejected) {
@@ -235,6 +277,7 @@ func (s *Server) handshake(conn net.Conn, u *user) (string, error) {
 				v1 := uint64(v.GetVersionV1())
 				version = (v1>>16)<<48 | (v1>>8&0xff)<<32 | (v1&0xff)<<16
 			}
+			u.version = version
 		case wire.TypeAuthenticate:
 			var a mumbleproto.Authenticate
 			if err := proto.Unmarshal(body, &a); err != nil {
@@ -263,20 +306,27 @@ func (s *Server) reject(u *user, t mumbleproto.Reject_RejectType, reason string)
 func (s *Server) join(u *user) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	taken := false
 	for _, o := range s.users {
-		if o.name == u.name {
-			s.reject(u, mumbleproto.Reject_UsernameInUse, "That user name is already in use.")
-			return false
-		}
+		taken = taken || o.name == u.name
 	}
-	s.next++
-	u.session = s.next
+	for _, r := range s.remote {
+		taken = taken || r.s.Name == u.name
+	}
+	if taken {
+		s.reject(u, mumbleproto.Reject_UsernameInUse, "That user name is already in use.")
+		return false
+	}
+	u.session = s.allocate()
 	s.users[u.session] = u
 
 	u.send(&mumbleproto.CodecVersion{Alpha: proto.Int32(-2147483637), Beta: proto.Int32(0), PreferAlpha: proto.Bool(true), Opus: proto.Bool(true)})
 	u.send(&mumbleproto.ChannelState{ChannelId: proto.Uint32(0), Name: proto.String("Root"), Position: proto.Int32(0)})
 	for _, o := range s.users {
 		u.send(o.state())
+	}
+	for _, r := range s.remote {
+		u.send(r.state())
 	}
 	u.send(&mumbleproto.ServerSync{
 		Session:      proto.Uint32(u.session),
@@ -296,6 +346,7 @@ func (s *Server) join(u *user) bool {
 			o.send(st)
 		}
 	}
+	s.announce(u)
 	return true
 }
 
@@ -303,11 +354,16 @@ func (s *Server) leave(u *user) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.users, u.session)
-	rm := &mumbleproto.UserRemove{Session: proto.Uint32(u.session)}
-	for _, o := range s.users {
-		o.send(rm)
-	}
 	s.log.Info("user left", "session", u.session, "name", u.name)
+	if u.replaced {
+		// The session lives on at another node; local clients keep seeing it from there.
+		return
+	}
+	s.seen.forget(u.session)
+	s.broadcast(&mumbleproto.UserRemove{Session: proto.Uint32(u.session)})
+	if s.cfg.Mesh != nil {
+		s.cfg.Mesh.Gone(u.session, u.claim, nodev1.SessionGone_REASON_LEFT)
+	}
 }
 
 func (s *Server) dispatch(u *user, t wire.Type, body []byte) {
@@ -365,13 +421,13 @@ func (s *Server) userState(u *user, st *mumbleproto.UserState) {
 	if !changed {
 		return
 	}
-	for _, o := range s.users {
-		o.send(out)
-	}
+	s.broadcast(out)
+	s.announce(u)
 }
 
-// voice forwards one voice packet from u. Normal talking reaches everyone else in u's channel who is not deaf;
-// server loopback goes back to u.
+// voice forwards one voice packet from u. Normal talking reaches everyone else in u's channel who is not deaf, here
+// and, through the interconnect, on the other nodes; server loopback goes back to u. A frame that has arrived
+// before (a speaker sending to two nodes during a drain) is dropped.
 func (s *Server) voice(u *user, packet []byte) {
 	if len(packet) == 0 || packet[0] != udpAudio {
 		return // pings over the tunnel and the legacy format are not forwarded
@@ -384,8 +440,11 @@ func (s *Server) voice(u *user, packet []byte) {
 	if target != targetNormal && target != targetLoopback {
 		return // whisper and shout come with voice targets
 	}
-	a.Header = &mumbleudp.Audio_Context{Context: 0}
 	a.SenderSession = u.session
+	if target == targetNormal && !s.seen.first(u.session, a.FrameNumber) {
+		return
+	}
+	a.Header = &mumbleudp.Audio_Context{Context: contextNormal}
 	body, err := proto.Marshal(&a)
 	if err != nil {
 		return
@@ -397,17 +456,28 @@ func (s *Server) voice(u *user, packet []byte) {
 		return
 	}
 	s.mu.Lock()
-	mute := u.mute
+	mute, channel := u.mute, u.channel
 	var to []*user
 	if !mute {
 		for _, o := range s.users {
-			if o != u && o.channel == u.channel && !o.deaf {
+			if o != u && o.channel == channel && !o.deaf {
 				to = append(to, o)
 			}
 		}
 	}
 	s.mu.Unlock()
+	if mute {
+		return
+	}
 	for _, o := range to {
 		o.queue(frame, true)
+	}
+	if s.cfg.Mesh != nil {
+		a.Header = nil
+		fwd, err := proto.Marshal(&a)
+		if err != nil {
+			return
+		}
+		s.cfg.Mesh.Forward(&nodev1.Voice{Audio: fwd, Route: &nodev1.Voice_ChannelId{ChannelId: channel}})
 	}
 }

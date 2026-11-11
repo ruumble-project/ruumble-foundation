@@ -8,5 +8,5 @@ RUN CGO_ENABLED=0 go build -trimpath -o /foundation ./cmd/foundation
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /foundation /foundation
-EXPOSE 64738/tcp
+EXPOSE 64738/tcp 64739/udp
 ENTRYPOINT ["/foundation"]

@@ -1,0 +1,76 @@
+// The interconnect between foundation nodes (ADR-0032): one QUIC connection per pair, ALPN "ruumble-node/1".
+// Draft: fields may change until the foundation's first release.
+//
+// Streams begin with a StreamHeader; after it, messages follow prefixed with their length as an unsigned varint, at
+// most 1 MiB each. Every QUIC datagram holds exactly one Datagram, without a prefix.
+syntax = "proto3";
+
+package ruumble.node.v1;
+
+import "ruumble/node/v1/live.proto";
+import "ruumble/node/v1/voice.proto";
+
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  // Opened once by the dialer right after the handshake; carries ControlFrame both ways.
+  STREAM_KIND_CONTROL = 1;
+  // Raft and blob transfer get their kinds when they are specified.
+}
+
+// First message on every stream.
+message StreamHeader {
+  StreamKind kind = 1;
+}
+
+// First frame on the control stream, from both sides. The connection is closed when cluster or node do not match
+// the cluster configuration and the peer's certificate.
+message Hello {
+  // Name of the cluster; peers of another cluster are refused.
+  string cluster = 1;
+  // Node number, 1 to 255; also the top 8 bits of every session id the node hands out.
+  uint32 node = 2;
+  // Short name for logs and the harness, e.g. "fsn1".
+  string name = 3;
+  // Random 16 bytes, new on every process start. A peer seen with a new incarnation has restarted: everything it
+  // announced before is replaced by its next Sync.
+  bytes incarnation = 4;
+  // Level within v1; a node accepts the level before its own (rolling updates, ADR-0029).
+  uint32 minor = 5;
+  // Foundation version, for logs only.
+  string build = 6;
+}
+
+// Everything reliable between two nodes, in order. After Hello, each side sends Sync once, then changes.
+message ControlFrame {
+  oneof frame {
+    Hello hello = 1;
+    Sync sync = 2;
+    Session session = 3;
+    SessionGone session_gone = 4;
+    NodeStatus node_status = 5;
+    UserCommand user_command = 6;
+    Deliver deliver = 7;
+  }
+}
+
+// Unreliable and unordered: never resent, never blocked by a stream.
+message Datagram {
+  oneof datagram {
+    Voice voice = 1;
+    Ping ping = 2;
+    Pong pong = 3;
+  }
+}
+
+// Sent every 500 ms. A peer without any datagram for 1.5 s is given up (ADR-0032).
+message Ping {
+  uint64 id = 1;
+  // Sender's monotonic clock in nanoseconds; only the sender reads it back.
+  fixed64 sent = 2;
+}
+
+// Answer to a Ping, sent at once.
+message Pong {
+  uint64 id = 1;
+  fixed64 sent = 2;
+}

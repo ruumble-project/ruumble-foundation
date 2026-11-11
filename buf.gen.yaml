@@ -5,6 +5,8 @@ inputs:
 managed:
   enabled: true
   override:
+    - file_option: go_package_prefix
+      value: github.com/ruumble-project/ruumble-foundation/gen
     - file_option: go_package
       path: mumble/Mumble.proto
       value: github.com/ruumble-project/ruumble-foundation/gen/mumble/mumbleproto

@@ -1,0 +1,26 @@
+// Voice forwarded between nodes (ADR-0032). Draft: fields may change until the foundation's first release.
+syntax = "proto3";
+
+package ruumble.node.v1;
+
+// A voice frame forwarded by the node it arrived on (origin) to every peer, as a datagram. Every receiving node
+// drops a frame whose (sender_session, frame_number) it has delivered already, then resolves the route against its
+// own clients and sets the context (normal, shout, whisper, listen) on what it sends to each.
+message Voice {
+  // MumbleUDP.Audio as the origin decoded it, with sender_session and frame_number set and the target field unset.
+  // Kept as bytes so this package does not import Mumble's files.
+  bytes audio = 1;
+  oneof route {
+    // Normal speech in this channel: users in it hear it, and users listening to it (ADR-0027).
+    uint32 channel_id = 2;
+    // A whisper or shout, resolved by the origin from the speaker's voice target.
+    Recipients whisper = 3;
+  }
+}
+
+// Who receives a whisper, a text message or a relay. Channels are expanded by the sender's node already (links and
+// subchannels), so the receiving node only checks which of its clients are in them.
+message Recipients {
+  repeated uint32 sessions = 1;
+  repeated uint32 channel_ids = 2;
+}

@@ -1,0 +1,74 @@
+// Live state and relay (ADR-0031). Draft: the snapshot follows the UI protocol in server/protocol (ADR-0007) and is
+// filled in when the foundation replaces Ice polling. Nothing here is written to Raft.
+syntax = "proto3";
+
+package ruumble.foundation.v1;
+
+import "ruumble/foundation/v1/common.proto";
+
+service LiveService {
+  // A snapshot first, then changes, filtered for the actor. Talking only reaches those who can hear (ADR-0005).
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+  // Hands something to be passed on (direct chat, nudge) to the recipient's node, which delivers it on their Watch.
+  rpc Relay(RelayRequest) returns (RelayResponse);
+}
+
+message WatchRequest {
+  Actor actor = 1;
+}
+
+message WatchResponse {
+  Position position = 1;
+  oneof event {
+    Snapshot snapshot = 2;
+    BoardChanged board_changed = 3;
+    Talking talking = 4;
+    Delivery delivery = 5;
+  }
+}
+
+// The whole state the actor may see. Fields follow server/protocol's snapshot; to be filled in.
+message Snapshot {}
+
+// Something on the board of this room changed; content is fetched with BoardService.ListPosts.
+message BoardChanged {
+  uint32 channel_id = 1;
+}
+
+message Talking {
+  uint32 session = 1;
+  bool talking = 2;
+}
+
+// Something passed on to the actor and never stored.
+message Delivery {
+  string id = 1;
+  string from_cert_hash = 2;
+  oneof body {
+    DirectMessage direct_message = 3;
+    Nudge nudge = 4;
+  }
+}
+
+message DirectMessage {
+  string text = 1;
+}
+
+message Nudge {
+  uint32 channel_id = 1;
+}
+
+message RelayRequest {
+  Actor actor = 1;
+  // Recipient, by the snapshot's person id.
+  string to_person = 2;
+  oneof body {
+    DirectMessage direct_message = 3;
+    Nudge nudge = 4;
+  }
+}
+
+message RelayResponse {
+  // False when the recipient is not connected anywhere in the cluster.
+  bool delivered = 1;
+}
